@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.agent/
+.npm-cache/
+.tmp/
+.cache/
+*.log
+*.tsbuildinfo
