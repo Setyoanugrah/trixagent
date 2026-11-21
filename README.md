@@ -79,13 +79,13 @@ Even after approval, agent credentials are never inherited by shell children or 
 
 ## GitHub Actions Runner
 
-`.github/workflows/runner.yml` integrates the agent into the existing Trixvler runner. It uses Node.js 22, installs both lockfiles with `npm ci`, runs the root and agent checks, and installs Chromium once for both Patchright applications.
+`.github/workflows/runner.yml` is a dedicated six-hour-style agent runner. It uses Node.js 22, runs the complete test suite, installs Chromium and Ollama, restores the model cache, then starts the Telegram agent.
 
 Ollama is pinned to `0.40.17`. The exact cached models are `qwen3:4b-instruct-2507-q4_K_M` (`0edcdef34593eac1aa2be9c7d06c432dcf81945adca5eca2f27662c18f168ba0`) and `qwen3-vl:4b-instruct-q4_K_M` (`84f7ed8042fa7cdbd902f7dcb7d0370e032095047cc3244179f263b77b5bc318`). Ollama uses a 32768-token context, one loaded model, one parallel request, a 10-minute keep-alive, and cloud features disabled. The agent requests 32768 tokens for text and caps vision requests at 16384.
 
-The agent workspace is an isolated directory under `RUNNER_TEMP`, never the live captcha checkout. Its clean environment receives only the runtime basics, Telegram credentials, Nebula URL/key, state encryption key, model settings, workspace and runner identity, lease settings, and explicit browser/snapshot settings. It does not receive Trixvler, provider, GitHub, tunnel, SSH, Cloudflare, or D1 credentials; durable state remains Nebula-only.
+The agent workspace is an isolated directory under `RUNNER_TEMP`, never the repository checkout. Its clean environment receives only the runtime basics, Telegram credentials, Nebula URL/key, state encryption key, model settings, workspace and runner identity, lease settings, and explicit browser/snapshot settings. It does not receive the workflow GitHub token; durable state remains Nebula-only.
 
-Add these four repository secrets for the agent: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `NEBULA_API_KEY`, and `STATE_ENCRYPTION_KEY`. Existing Trixvler, Tailscale, SSH, provider, and tunnel settings remain independent.
+Add these four repository secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `NEBULA_API_KEY`, and `STATE_ENCRYPTION_KEY`.
 
 Overlapping workflow runs are intentional and there is no blocking concurrency group. The Nebula lease selects the active runner while another may remain at `lease.waiting`; the workflow redispatches at minute 270, stops its keepalive at minute 300, and gives graceful agent snapshot/checkpoint/lease cleanup up to five minutes.
 
