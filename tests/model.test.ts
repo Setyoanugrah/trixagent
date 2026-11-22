@@ -149,6 +149,57 @@ test("Groq retries retryable failures then uses Gemini strict JSON fallback", as
   assert.deepEqual(decision.usage, { promptTokens: 30, completionTokens: 9 });
 });
 
+test("Groq HTTP 413 falls back to Gemini without retrying", async () => {
+  let groqRequests = 0;
+  let geminiRequests = 0;
+  const mockFetch: typeof fetch = async (input) => {
+    if (String(input).includes("api.groq.com")) {
+      groqRequests += 1;
+      return Response.json({ error: { message: "TPM limit 8000, requested 24000" } }, { status: 413 });
+    }
+    geminiRequests += 1;
+    return Response.json({ candidates: [{ content: { parts: [{ text: '{"type":"final","content":"fallback ok"}' }] } }] });
+  };
+  const client = new ModelClient(
+    GROQ_KEY,
+    GEMINI_KEY,
+    "openai/gpt-oss-120b",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    mockFetch,
+    0,
+  );
+
+  const decision = await client.decide([{ role: "user", content: "large request" }], [TOOL]);
+  assert.equal(groqRequests, 1);
+  assert.equal(geminiRequests, 1);
+  assert.equal(decision.final, "fallback ok");
+});
+
+test("oversized prompts route directly to Gemini", async () => {
+  let groqRequests = 0;
+  let geminiRequests = 0;
+  const mockFetch: typeof fetch = async (input) => {
+    if (String(input).includes("api.groq.com")) groqRequests += 1;
+    else geminiRequests += 1;
+    return Response.json({ candidates: [{ content: { parts: [{ text: '{"type":"final","content":"large ok"}' }] } }] });
+  };
+  const client = new ModelClient(
+    GROQ_KEY,
+    GEMINI_KEY,
+    "openai/gpt-oss-120b",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    mockFetch,
+    0,
+  );
+
+  const decision = await client.decide([{ role: "user", content: "x".repeat(30_000) }], [TOOL]);
+  assert.equal(groqRequests, 0);
+  assert.equal(geminiRequests, 1);
+  assert.equal(decision.final, "large ok");
+});
+
 test("Gemini vision falls back to the lite model and sends detected MIME", async () => {
   const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
   const mockFetch: typeof fetch = async (input, init) => {

@@ -7,6 +7,7 @@ const GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/mode
 const MAX_COMPLETION_TOKENS = 4_096;
 const REQUEST_TIMEOUT_MS = 90_000;
 const MAX_ATTEMPTS = 3;
+const GROQ_PROMPT_TOKEN_BUDGET = 6_000;
 
 export interface ModelDecision {
   assistant: ChatMessage;
@@ -45,10 +46,14 @@ export class ModelClient {
   public async decide(messages: ChatMessage[], tools: ToolDefinition[], signal?: AbortSignal): Promise<ModelDecision> {
     const safeMessages = sanitizeMessages(messages, this.secrets);
     const providerTools = toProviderTools(tools);
+    const groqMessages = toOpenAiMessages(safeMessages, providerTools.internalToProvider);
+    if (estimatedTokens({ messages: groqMessages, tools: providerTools.definitions }) > GROQ_PROMPT_TOKEN_BUDGET) {
+      return this.decideWithGemini(safeMessages, tools, signal);
+    }
     try {
       const payload = await this.requestGroq({
         model: this.model,
-        messages: toOpenAiMessages(safeMessages, providerTools.internalToProvider),
+        messages: groqMessages,
         tools: providerTools.definitions,
         tool_choice: "auto",
         temperature: 0.1,
@@ -186,11 +191,12 @@ export class ModelClient {
         if (response.ok) return payload;
 
         const retryable = response.status === 429 || response.status >= 500;
+        const fallbackEligible = response.status === 413 || retryable;
         const providerError = new ModelProviderError(
           "Groq",
           this.model,
           `HTTP ${response.status}: ${providerErrorDetail(payload, response.status, this.secrets)}`,
-          retryable,
+          fallbackEligible,
           response.status,
         );
         lastError = providerError;
@@ -199,6 +205,7 @@ export class ModelClient {
       } catch (error) {
         if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : error;
         if (error instanceof ModelProviderError) {
+          if (error.status === 413) throw error;
           if (!error.fallbackEligible || attempt === MAX_ATTEMPTS - 1) throw error;
           continue;
         }
@@ -615,4 +622,8 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function optionalNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function estimatedTokens(value: unknown): number {
+  return Math.ceil(JSON.stringify(value).length / 4);
 }
