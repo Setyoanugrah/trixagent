@@ -7,9 +7,11 @@ export interface AgentConfig {
   telegramOwnerId: number;
   nebulaApiKey: string;
   nebulaBaseUrl: string;
-  ollamaBaseUrl: string;
+  groqApiKey: string;
+  geminiApiKey: string;
   agentModel: string;
   visionModel: string;
+  geminiFallbackModel: string;
   workspaceRoot: string;
   runnerId: string;
   leaseName: string;
@@ -78,9 +80,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AgentConfig {
     telegramOwnerId: owner,
     nebulaApiKey: required(env, "NEBULA_API_KEY"),
     nebulaBaseUrl: normalizedUrl(env.NEBULA_BASE_URL ?? "https://drive.rikuzetsi.my.id", "NEBULA_BASE_URL"),
-    ollamaBaseUrl: normalizedUrl(env.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434", "OLLAMA_BASE_URL"),
-    agentModel: env.AGENT_MODEL?.trim() || "qwen3:4b-instruct-2507-q4_K_M",
-    visionModel: env.VISION_MODEL?.trim() || "qwen3-vl:4b-instruct-q4_K_M",
+    groqApiKey: required(env, "GROQ_API_KEY"),
+    geminiApiKey: required(env, "GEMINI_API_KEY"),
+    agentModel: env.AGENT_MODEL?.trim() || "openai/gpt-oss-120b",
+    visionModel: env.VISION_MODEL?.trim() || "gemini-3.5-flash",
+    geminiFallbackModel: env.GEMINI_FALLBACK_MODEL?.trim() || "gemini-3.1-flash-lite",
     workspaceRoot: resolve(env.WORKSPACE_ROOT?.trim() || process.cwd()),
     runnerId: env.RUNNER_ID?.trim() || `${hostname()}-${process.pid}-${randomBytes(4).toString("hex")}`,
     leaseName: env.LEASE_NAME?.trim() || "telegram-autonomous-agent",
@@ -104,6 +108,8 @@ export function configuredSecrets(config: AgentConfig): string[] {
   return [
     config.telegramToken,
     config.nebulaApiKey,
+    config.groqApiKey,
+    config.geminiApiKey,
     config.stateEncryptionKey,
   ].filter((value): value is string => typeof value === "string" && value.length > 0);
 }

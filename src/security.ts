@@ -73,7 +73,7 @@ export function classifyToolRisk(name: string, args: Record<string, unknown>): R
     if (/\b(drop\s+(table|database)|delete\s+from|shutdown\b|reboot\b|poweroff\b)\b/.test(command)) {
       reasons.add("destructive system or database operation");
     }
-    if (/\b(telegram_bot_token|nebula_api_key|state_encryption_key|password|secret)\b|\bprintenv\b|\/proc\/\d+\/environ/.test(command)) {
+    if (/\b(telegram_bot_token|nebula_api_key|groq_api_key|gemini_api_key|state_encryption_key|password|secret)\b|\bprintenv\b|\/proc\/\d+\/environ/.test(command)) {
       reasons.add("secret access");
     }
     if (/(^|[\s/])(\.env(?:\.[\w-]+)?|\.npmrc|\.pypirc|\.git-credentials|id_rsa|id_ed25519)(\s|$)/.test(command)) {

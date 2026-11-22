@@ -5,9 +5,9 @@ import { TelegramBotController } from "./bot.js";
 import { configuredSecrets, loadConfig } from "./config.js";
 import { LeaseManager } from "./lease.js";
 import { Logger } from "./logger.js";
+import { ModelClient } from "./model.js";
 import { NebulaClient } from "./nebula.js";
 import { NebulaStateClient } from "./nebula-state.js";
-import { OllamaClient } from "./ollama.js";
 import { SecretRedactor } from "./security.js";
 import { SnapshotService } from "./snapshots.js";
 import { AgentStore } from "./store.js";
@@ -95,11 +95,12 @@ async function main(): Promise<void> {
       },
       nebula,
     );
-    const ollama = new OllamaClient(
-      config.ollamaBaseUrl,
+    const modelClient = new ModelClient(
+      config.groqApiKey,
+      config.geminiApiKey,
       config.agentModel,
       config.visionModel,
-      config.maxContextTokens,
+      config.geminiFallbackModel,
     );
     await browser.initialize().catch((error) => {
       logger.warn("browser.startup_failed", { error: errorMessage(error) });
@@ -115,18 +116,21 @@ async function main(): Promise<void> {
       config.shellTimeoutMs,
       config.maxToolOutputBytes,
       browser,
-      ollama,
+      modelClient,
       store,
       redactor,
       nebula,
     );
-    engine = new AgentEngine(config, store, ollama, tools, telegram, logger, redactor);
-    const bot = new TelegramBotController(config, telegram, store, lease, engine, browser, ollama, logger, redactor);
+    engine = new AgentEngine(config, store, modelClient, tools, telegram, logger, redactor);
+    const bot = new TelegramBotController(config, telegram, store, lease, engine, browser, modelClient, logger, redactor);
 
     logger.info("runner.ready", {
       runnerId: config.runnerId,
+      textProvider: "groq",
       model: config.agentModel,
+      visionProvider: "gemini",
       visionModel: config.visionModel,
+      geminiFallbackModel: config.geminiFallbackModel,
       workspaceRoot: config.workspaceRoot,
       unsafeAuto: config.unsafeAuto,
     });

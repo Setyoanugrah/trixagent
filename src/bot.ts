@@ -3,7 +3,7 @@ import type { BrowserManager } from "./browser.js";
 import type { AgentConfig } from "./config.js";
 import type { LeaseManager } from "./lease.js";
 import type { Logger } from "./logger.js";
-import type { OllamaClient } from "./ollama.js";
+import type { ModelClient } from "./model.js";
 import type { SecretRedactor } from "./security.js";
 import type { AgentStore } from "./store.js";
 import type { TelegramCallbackQuery, TelegramClient, TelegramMessage, TelegramUpdate } from "./telegram.js";
@@ -20,7 +20,7 @@ export class TelegramBotController {
     private readonly lease: LeaseManager,
     private readonly engine: AgentEngine,
     private readonly browser: BrowserManager,
-    private readonly ollama: OllamaClient,
+    private readonly modelClient: ModelClient,
     private readonly logger: Logger,
     private readonly redactor: SecretRedactor,
   ) {}
@@ -249,8 +249,9 @@ export class TelegramBotController {
     return [
       `Runner: ${this.config.runnerId}`,
       `Uptime: ${uptime}s`,
-      `Model: ${this.ollama.modelName()}`,
-      `Vision: ${this.ollama.visionModelName()}`,
+      `Model: Groq ${this.modelClient.modelName()}`,
+      `Text fallback: Gemini ${this.modelClient.visionModelName()} -> ${this.modelClient.geminiFallbackModelName()}`,
+      `Vision: Gemini ${this.modelClient.visionModelName()} -> ${this.modelClient.geminiFallbackModelName()}`,
       `Lease: ${lease?.holder_id === this.config.runnerId ? "held" : "not held"} holder=${lease?.holder_id || "none"} expires=${lease?.expires_at ?? "unknown"}`,
       `Contender: ${lease?.contender_id ?? "none"}${lease?.contender_seen_at ? ` seen=${lease.contender_seen_at}` : ""}`,
       `Browser: ${this.browser.isStarted() ? "started" : "not started"}`,

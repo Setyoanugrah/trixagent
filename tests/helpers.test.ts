@@ -1,20 +1,30 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { loadConfig } from "../src/config.js";
+import { configuredSecrets, loadConfig } from "../src/config.js";
 import { retryDelayMs } from "../src/nebula.js";
 import { SecretRedactor, sanitizedChildEnvironment } from "../src/security.js";
 import { compactMessages } from "../src/utils.js";
 
-test("configuration requires Nebula and retains model/context defaults", () => {
+test("configuration requires cloud providers and retains model/context defaults", () => {
   const base = {
     TELEGRAM_BOT_TOKEN: "123456:abcdefghijklmnopqrstuvwxyz",
     TELEGRAM_OWNER_ID: "123456",
   };
   assert.throws(() => loadConfig(base), /NEBULA_API_KEY/);
-  const config = loadConfig({ ...base, NEBULA_API_KEY: "test-nebula-key" });
-  assert.equal(config.agentModel, "qwen3:4b-instruct-2507-q4_K_M");
-  assert.equal(config.visionModel, "qwen3-vl:4b-instruct-q4_K_M");
+  assert.throws(() => loadConfig({ ...base, NEBULA_API_KEY: "test-nebula-key" }), /GROQ_API_KEY/);
+  assert.throws(() => loadConfig({ ...base, NEBULA_API_KEY: "test-nebula-key", GROQ_API_KEY: "test-groq-key" }), /GEMINI_API_KEY/);
+  const config = loadConfig({
+    ...base,
+    NEBULA_API_KEY: "test-nebula-key",
+    GROQ_API_KEY: "test-groq-key",
+    GEMINI_API_KEY: "test-gemini-key",
+  });
+  assert.equal(config.agentModel, "openai/gpt-oss-120b");
+  assert.equal(config.visionModel, "gemini-3.5-flash");
+  assert.equal(config.geminiFallbackModel, "gemini-3.1-flash-lite");
   assert.equal(config.maxContextTokens, 32_768);
+  const redacted = new SecretRedactor(configuredSecrets(config)).redactText("test-groq-key test-gemini-key");
+  assert.equal(redacted, "[REDACTED] [REDACTED]");
 });
 
 test("retryDelayMs honors numeric headers and JSON wait hints", () => {
@@ -33,6 +43,8 @@ test("secret redaction and child environment exclude credentials", () => {
   const env = sanitizedChildEnvironment(process.cwd());
   assert.equal(env.TELEGRAM_BOT_TOKEN, undefined);
   assert.equal(env.NEBULA_API_KEY, undefined);
+  assert.equal(env.GROQ_API_KEY, undefined);
+  assert.equal(env.GEMINI_API_KEY, undefined);
   assert.equal(env.HOME, process.cwd());
   assert.equal(env.GIT_TERMINAL_PROMPT, "0");
 });

@@ -4,7 +4,7 @@ import { dirname, join, relative } from "node:path";
 import type { BrowserManager } from "./browser.js";
 import type { AgentStore } from "./store.js";
 import type { NebulaClient } from "./nebula.js";
-import type { OllamaClient } from "./ollama.js";
+import type { ModelClient } from "./model.js";
 import type { SecretRedactor } from "./security.js";
 import { classifyToolRisk, isSecretBearingPath, resolveConfinedPath, sanitizedChildEnvironment } from "./security.js";
 import type { ToolCall, ToolDefinition } from "./types.js";
@@ -90,7 +90,7 @@ export class ToolExecutor {
     private readonly shellTimeoutMs: number,
     private readonly maxOutputBytes: number,
     private readonly browser: BrowserManager,
-    private readonly ollama: OllamaClient,
+    private readonly modelClient: ModelClient,
     private readonly store: AgentStore,
     private readonly redactor: SecretRedactor,
     private readonly nebula?: NebulaClient,
@@ -298,7 +298,7 @@ export class ToolExecutor {
     if (!metadata.isFile() || metadata.size > 25 * 1024 * 1024) throw new Error("vision.inspect requires an image no larger than 25 MiB");
     const image = await readFile(path);
     const prompt = optionalString(args, "prompt") ?? "Describe this image precisely and identify UI controls, visible text, errors, and relevant state.";
-    return this.redactor.redactText(await this.ollama.inspectImage(image.toString("base64"), prompt, signal));
+    return this.redactor.redactText(await this.modelClient.inspectImage(image.toString("base64"), prompt, signal));
   }
 
   private requiredNebula(): NebulaClient {

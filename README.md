@@ -1,6 +1,6 @@
 # Telegram Autonomous Runner Agent
 
-Node.js 20+ ESM TypeScript agent for ephemeral Ubuntu runners (the integrated workflow uses Node.js 22). Telegram is the control plane, Ollama supplies local text and vision models, Nebula is the only durable state, lease, snapshot, and artifact backend, and Patchright controls Chromium.
+Node.js 20+ ESM TypeScript agent for ephemeral Ubuntu runners (the integrated workflow uses Node.js 22). Telegram is the control plane, Groq supplies native text/tool decisions, Gemini supplies text fallback and vision, Nebula is the only durable state, lease, snapshot, and artifact backend, and Patchright controls Chromium.
 
 ## Properties
 
@@ -11,7 +11,7 @@ Node.js 20+ ESM TypeScript agent for ephemeral Ubuntu runners (the integrated wo
 - A renewable Nebula lease ensures only one overlapping runner polls Telegram or executes tasks at a time. Other runner jobs may remain alive and acquire the lease when it expires.
 - Every task and user message is durable before model execution. Every tool call transitions through pending, running, and a terminal state.
 - Running and waiting tasks resume from checkpoints after restart. A shell process interrupted with its runner is recorded as failed and is not silently rerun.
-- Native Ollama tool calls are preferred. Models without tool support use a strict single-object JSON protocol.
+- Groq native tool calls are preferred. After retryable Groq failures, Gemini uses a strict single-object JSON protocol with the available tool schemas in its prompt.
 - Browser and document content is treated as untrusted data. Child processes receive an allowlisted environment without agent credentials.
 - Risky actions create a durable approval with Telegram Approve/Reject buttons. `AGENT_UNSAFE_AUTO` defaults to `false`.
 
@@ -38,20 +38,24 @@ npm start
 | `TELEGRAM_BOT_TOKEN` | Bot token used only by the Telegram client |
 | `TELEGRAM_OWNER_ID` | Positive numeric Telegram user ID |
 | `NEBULA_API_KEY` | Bearer and `X-API-Key` credential for state, lease, and file APIs |
+| `GROQ_API_KEY` | Groq credential for text decisions and native tool calls |
+| `GEMINI_API_KEY` | Gemini credential for text fallback and image inspection |
 | `WORKSPACE_ROOT` | Existing directory all agent file operations are confined to |
 
 ### Model And Browser Environment
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama HTTP endpoint |
-| `AGENT_MODEL` | `qwen3:4b-instruct-2507-q4_K_M` | Text and tool model |
-| `VISION_MODEL` | `qwen3-vl:4b-instruct-q4_K_M` | Screenshot and image model |
+| `AGENT_MODEL` | `openai/gpt-oss-120b` | Groq text and native-tool model |
+| `VISION_MODEL` | `gemini-3.5-flash` | Primary Gemini vision and text-fallback model |
+| `GEMINI_FALLBACK_MODEL` | `gemini-3.1-flash-lite` | Gemini fallback after primary model 404, throttling, server error, or empty output |
 | `CHROMIUM_EXECUTABLE_PATH` | Patchright default | Explicit Chromium binary |
 | `BROWSER_HEADLESS` | `true` | Headless persistent context |
 | `AGENT_MAX_ITERATIONS` | `16` | Bounded steps per run or resume |
-| `AGENT_MAX_CONTEXT_TOKENS` | `32768` | Text context; vision is capped at `16384` |
+| `AGENT_MAX_CONTEXT_TOKENS` | `32768` | Local message-compaction budget only |
 | `AGENT_UNSAFE_AUTO` | `false` | Bypass the approval classifier only when explicitly enabled |
+
+Groq requests use `https://api.groq.com/openai/v1/chat/completions` with low temperature, bounded completion output, and `tool_choice: auto`. Gemini requests use `https://generativelanguage.googleapis.com/v1beta/models` with the key in `x-goog-api-key`; image bytes are sent as `inlineData` after PNG, JPEG, or WebP magic-byte detection. Provider keys are redacted alongside the other credentials and are not inherited by tool subprocesses.
 
 The Chromium profile lives at `WORKSPACE_ROOT/.agent/browser-profile`. Browser cookies and local storage are checkpointed in the Nebula state blob; when `STATE_ENCRYPTION_KEY` is set, that KV value is AES-256-GCM encrypted.
 
@@ -79,17 +83,15 @@ Even after approval, agent credentials are never inherited by shell children or 
 
 ## GitHub Actions Runner
 
-`.github/workflows/runner.yml` is a dedicated six-hour-style agent runner. It uses Node.js 22, runs the complete test suite, installs Chromium and Ollama, restores the model cache, then starts the Telegram agent.
-
-Ollama is pinned to `0.40.17`. The exact cached models are `qwen3:4b-instruct-2507-q4_K_M` (`0edcdef34593eac1aa2be9c7d06c432dcf81945adca5eca2f27662c18f168ba0`) and `qwen3-vl:4b-instruct-q4_K_M` (`84f7ed8042fa7cdbd902f7dcb7d0370e032095047cc3244179f263b77b5bc318`). Ollama uses a 32768-token context, one loaded model, one parallel request, a 10-minute keep-alive, and cloud features disabled. The agent requests 32768 tokens for text and caps vision requests at 16384.
+`.github/workflows/runner.yml` is a dedicated six-hour-style agent runner. It uses Node.js 22, runs the complete test suite, installs Chromium, and starts the Telegram agent without a local model installation or cache warmup.
 
 The agent workspace is an isolated directory under `RUNNER_TEMP`, never the repository checkout. Its clean environment receives only the runtime basics, Telegram credentials, Nebula URL/key, state encryption key, model settings, workspace and runner identity, lease settings, and explicit browser/snapshot settings. It does not receive the workflow GitHub token; durable state remains Nebula-only.
 
-Add these four repository secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `NEBULA_API_KEY`, and `STATE_ENCRYPTION_KEY`.
+Add these six repository secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `NEBULA_API_KEY`, `STATE_ENCRYPTION_KEY`, `GROQ_API_KEY`, and `GEMINI_API_KEY`.
 
-Overlapping workflow runs are intentional and there is no blocking concurrency group. The Nebula lease selects the active runner while another may remain at `lease.waiting`; the workflow redispatches at minute 270, stops its keepalive at minute 300, and gives graceful agent snapshot/checkpoint/lease cleanup up to five minutes.
+Overlapping workflow runs are intentional and there is no blocking concurrency group. The Nebula lease selects the active runner while another may remain at `lease.waiting`; the workflow redispatches at minute 300, ends its monitor at minute 320, and gives graceful agent snapshot/checkpoint/lease cleanup up to five minutes.
 
-Tests use mocked network responses and do not start Ollama, Telegram, Chromium, or Nebula.
+Tests use mocked network responses and make no real Groq, Gemini, Telegram, Chromium, or Nebula calls.
 
 ## Files
 
@@ -99,6 +101,6 @@ Tests use mocked network responses and do not start Ollama, Telegram, Chromium, 
 - `src/agent.ts`: bounded model/tool loop and durable approvals.
 - `src/tools.ts`: confined tool implementations and secret-free subprocesses.
 - `src/browser.ts`: Patchright persistent context, CDP snapshots, screenshots, and durable browser state.
-- `src/telegram.ts`, `src/ollama.ts`, `src/nebula.ts`: native-fetch service clients.
+- `src/model.ts`, `src/telegram.ts`, `src/nebula.ts`: native-fetch service clients.
 - `src/security.ts`, `src/crypto.ts`: path/risk controls, redaction, and AES-256-GCM helpers.
 - `tests/`: offline coverage including state conflicts and lease transport.

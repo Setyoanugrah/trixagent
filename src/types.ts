@@ -40,6 +40,7 @@ export interface ChatMessage {
   images?: string[];
   tool_calls?: ModelToolCall[];
   tool_name?: string;
+  tool_call_id?: string;
 }
 
 export interface PendingToolCall {
