@@ -1,0 +1,18 @@
+{
+  "name": "TRIΧTOM / TrixAgent Dashboard",
+  "short_name": "TrixAgent",
+  "description": "Read-only public operational dashboard for TrixAgent.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#050a10",
+  "theme_color": "#050a10",
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
