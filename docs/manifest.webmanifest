@@ -1,12 +1,12 @@
 {
-  "name": "TRIΧTOM / TrixAgent Dashboard",
+  "name": "TrixAgent — private agent console",
   "short_name": "TrixAgent",
-  "description": "Read-only public operational dashboard for TrixAgent.",
+  "description": "A private chat interface for the durable TrixAgent runner.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#050a10",
-  "theme_color": "#050a10",
+  "background_color": "#070a0c",
+  "theme_color": "#070a0c",
   "icons": [
     {
       "src": "favicon.svg",

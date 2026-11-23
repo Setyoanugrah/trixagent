@@ -1,5 +1,6 @@
 import type { AgentEngine } from "./agent.js";
 import type { BrowserManager } from "./browser.js";
+import { notificationChatId } from "./chat.js";
 import type { AgentConfig } from "./config.js";
 import type { LeaseManager } from "./lease.js";
 import type { Logger } from "./logger.js";
@@ -55,8 +56,8 @@ export class TelegramBotController {
         ? truncate(this.redactor.redactText(toolRun.arguments_json), 1_400)
         : "[tool arguments unavailable]";
       const message = await this.telegram.sendMessage(
-        approval.chat_id,
-        `Approval still required after runner restart\nTool: ${toolRun?.tool_name ?? "unknown"}\nReason: ${approval.reason}\nArguments: ${displayArgs}`,
+        notificationChatId(approval.chat_id, this.config.telegramOwnerId),
+        `Approval still required after runner restart\nTask: ${approval.task_id.slice(0, 8)}\nTool: ${toolRun?.tool_name ?? "unknown"}\nReason: ${approval.reason}\nArguments: ${displayArgs}`,
         [[
           { text: "Approve", callback_data: `approve:${approval.id}:${nonce}` },
           { text: "Reject", callback_data: `reject:${approval.id}:${nonce}` },

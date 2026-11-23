@@ -1,3 +1,4 @@
+import { isTelegramChat, notificationChatId } from "./chat.js";
 import type { AgentConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import type { ModelClient } from "./model.js";
@@ -65,7 +66,9 @@ export class AgentEngine {
   private async runTask(initialTask: TaskRecord): Promise<void> {
     const controller = new AbortController();
     this.taskControllers.set(initialTask.id, controller);
-    const stopTyping = this.telegram.startTyping(initialTask.chat_id, controller.signal);
+    const stopTyping = isTelegramChat(initialTask.chat_id)
+      ? this.telegram.startTyping(initialTask.chat_id, controller.signal)
+      : () => undefined;
     let task = initialTask;
     let checkpoint = parseCheckpoint(task.checkpoint_json);
     let summary = task.summary;
@@ -125,14 +128,18 @@ export class AgentEngine {
         summary = appendSummary(summary, `Completed at iteration ${iteration}: ${truncate(final, 800)}`);
         await this.store.appendMessage(task.chat_id, task.id, "assistant", "final", final);
         await this.store.updateTask(task.id, "completed", summary, checkpoint, iteration);
-        await this.telegram.sendLongMessage(task.chat_id, final, controller.signal);
+        if (isTelegramChat(task.chat_id)) {
+          await this.telegram.sendLongMessage(task.chat_id, final, controller.signal);
+        }
         this.logger.info("agent.task_completed", { taskId: task.id, iteration });
         return;
       }
 
       const reason = `Iteration budget (${this.config.maxIterations}) exhausted. Use /resume to continue from the checkpoint.`;
       await this.store.updateTask(task.id, "failed", summary, checkpoint, iteration, reason);
-      await this.telegram.sendMessage(task.chat_id, reason, undefined, controller.signal);
+      if (isTelegramChat(task.chat_id)) {
+        await this.telegram.sendMessage(task.chat_id, reason, undefined, controller.signal);
+      }
       this.logger.warn("agent.iteration_budget_exhausted", { taskId: task.id, iteration });
     } catch (error) {
       const latest = await this.store.getTask(task.id).catch(() => undefined);
@@ -144,7 +151,9 @@ export class AgentEngine {
       } else {
         const message = this.redactor.redactText(errorMessage(error));
         await this.store.updateTask(task.id, "failed", summary, checkpoint, iteration, message).catch(() => undefined);
-        await this.telegram.sendMessage(task.chat_id, `Task failed at checkpoint ${iteration}: ${truncate(message, 1200)}\nUse /resume to retry.`, undefined).catch(() => undefined);
+        if (isTelegramChat(task.chat_id)) {
+          await this.telegram.sendMessage(task.chat_id, `Task failed at checkpoint ${iteration}: ${truncate(message, 1200)}\nUse /resume to retry.`, undefined).catch(() => undefined);
+        }
         this.logger.error("agent.task_failed", { taskId: task.id, iteration, error: message });
       }
     } finally {
@@ -206,8 +215,8 @@ export class AgentEngine {
           const nonce = await this.store.rotateApprovalNonce(approval.id);
           const displayArgs = truncate(safeJson(this.redactor.redactValue(pending.call.arguments)), 1_400);
           const message = await this.telegram.sendMessage(
-            task.chat_id,
-            `Approval required\nTool: ${pending.call.name}\nReason: ${approval.reason}\nArguments: ${displayArgs}`,
+            notificationChatId(approval.chat_id, this.config.telegramOwnerId),
+            `Approval required\nTask: ${task.id.slice(0, 8)}${task.chat_id.startsWith("web:") ? " (web chat)" : ""}\nTool: ${pending.call.name}\nReason: ${approval.reason}\nArguments: ${displayArgs}`,
             [[
               { text: "Approve", callback_data: `approve:${approval.id}:${nonce}` },
               { text: "Reject", callback_data: `reject:${approval.id}:${nonce}` },
@@ -232,7 +241,8 @@ export class AgentEngine {
       const risk = classifyToolRisk(pending.call.name, pending.call.arguments);
       if (risk.risky) {
         const reason = risk.reasons.join("; ");
-        const { approval, nonce } = await this.store.createApproval(task.id, toolRun.id, task.chat_id, reason);
+        const approvalChatId = notificationChatId(task.chat_id, this.config.telegramOwnerId);
+        const { approval, nonce } = await this.store.createApproval(task.id, toolRun.id, approvalChatId, reason);
         pending.approvalId = approval.id;
         await this.store.updateTask(task.id, "waiting_approval", summary, checkpoint, iteration);
         const displayArgs = truncate(
@@ -240,8 +250,8 @@ export class AgentEngine {
           1_400,
         );
         const message = await this.telegram.sendMessage(
-          task.chat_id,
-          `Approval required\nTool: ${pending.call.name}\nReason: ${reason}\nArguments: ${displayArgs}`,
+          approvalChatId,
+          `Approval required\nTask: ${task.id.slice(0, 8)}${task.chat_id.startsWith("web:") ? " (web chat)" : ""}\nTool: ${pending.call.name}\nReason: ${reason}\nArguments: ${displayArgs}`,
           [[
             { text: "Approve", callback_data: `approve:${approval.id}:${nonce}` },
             { text: "Reject", callback_data: `reject:${approval.id}:${nonce}` },

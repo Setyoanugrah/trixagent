@@ -53,6 +53,7 @@ async function main(): Promise<void> {
   let leaseHeld = false;
   let runnerHeartbeat: NodeJS.Timeout | undefined;
   let snapshotTimer: NodeJS.Timeout | undefined;
+  let taskKickTimer: NodeJS.Timeout | undefined;
   let engine: AgentEngine | undefined;
   let browser: BrowserManager | undefined;
   let snapshots: SnapshotService | undefined;
@@ -137,11 +138,14 @@ async function main(): Promise<void> {
     await bot.restorePendingApprovals(shutdown.signal).catch((error) => {
       logger.warn("agent.approval_restore_failed", { error: errorMessage(error) });
     });
+    taskKickTimer = setInterval(() => engine?.kick(), 4_000);
+    taskKickTimer.unref();
     engine.kick();
     await bot.poll(shutdown.signal);
   } finally {
     if (runnerHeartbeat !== undefined) clearInterval(runnerHeartbeat);
     if (snapshotTimer !== undefined) clearInterval(snapshotTimer);
+    if (taskKickTimer !== undefined) clearInterval(taskKickTimer);
     await engine?.shutdown().catch((error) => logger.warn("runner.engine_shutdown_failed", { error: errorMessage(error) }));
     await browser?.close().catch((error) => logger.warn("runner.browser_shutdown_failed", { error: errorMessage(error) }));
     await store.stopRunner(config.runnerId).catch((error) => logger.warn("runner.stop_record_failed", { error: errorMessage(error) }));

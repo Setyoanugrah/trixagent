@@ -1,655 +1,899 @@
 "use strict";
 
 (() => {
-  const STATUS_URL = "https://drive.rikuzetsi.my.id/api/agent/public-status";
-  const POLL_INTERVAL_MS = 20_000;
-  const REQUEST_TIMEOUT_MS = 8_000;
-  const MAX_BACKOFF_MS = 160_000;
-  const DEFAULT_STALE_AFTER_SECONDS = 120;
+  const API_BASE = "https://drive.rikuzetsi.my.id";
+  const TOKEN_KEY = "trixagent.web.token";
+  const POLL_ACTIVE_MS = 2_000;
+  const POLL_WAITING_MS = 5_000;
+  const POLL_IDLE_MS = 10_000;
+  const STATUS_MS = 20_000;
+  const REQUEST_TIMEOUT_MS = 12_000;
+  const OPEN_STATUSES = new Set(["waiting", "running", "waiting_approval"]);
 
-  const elements = {};
-  const ids = [
-    "live-state",
-    "state-context",
-    "state-announcement",
-    "last-checked",
-    "next-check",
-    "api-transport",
-    "status-detail",
-    "refresh-button",
-    "operating-mode",
-    "snapshot-note",
-    "lease-state",
-    "lease-caption",
-    "lease-expiry",
-    "lease-handoff",
-    "runner-state",
-    "runner-caption",
-    "runner-last-seen",
-    "runner-recency",
-    "task-state",
-    "task-caption",
-    "task-iteration",
-    "task-updated",
-    "queue-waiting",
-    "queue-running",
-    "queue-approval",
-    "queue-total",
-    "memory-messages",
-    "memory-tasks",
-    "memory-bytes",
-    "tools-completed",
-    "tools-running",
-    "tools-failed",
-    "tools-total",
-    "activity-list",
-  ];
+  const state = {
+    token: sessionStorage.getItem(TOKEN_KEY) || "",
+    messages: [],
+    tasks: [],
+    signature: "",
+    activeTask: null,
+    publicStatus: null,
+    sending: false,
+    loading: false,
+    pollTimer: 0,
+    statusTimer: 0,
+    toastTimer: 0,
+    taskModalId: null,
+    taskModalTask: null,
+    authError: "",
+  };
 
-  let pollTimer;
-  let clockTimer;
-  let nextPollAt = 0;
-  let inFlight = false;
-  let failureCount = 0;
-  let lastSnapshot = null;
-  let lastAnnouncedState = "booting";
+  const el = {};
+
+  class AuthError extends Error {}
 
   function initialize() {
-    for (const id of ids) elements[id] = document.getElementById(id);
-    elements["refresh-button"].addEventListener("click", pollNow);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    window.addEventListener("online", pollNow);
-    window.addEventListener("offline", () => renderUnavailable("Browser network is offline."));
-    clockTimer = window.setInterval(updateClocks, 1_000);
-    updateClocks();
-    void pollStatus();
+    for (const id of [
+      "app-shell",
+      "sidebar",
+      "sidebar-close",
+      "sidebar-scrim",
+      "menu-button",
+      "new-chat",
+      "task-list",
+      "task-count",
+      "sidebar-status",
+      "sidebar-signal",
+      "status-toggle",
+      "settings-button",
+      "status-chip",
+      "top-status",
+      "top-signal",
+      "model-name",
+      "conversation-name",
+      "transcript",
+      "welcome",
+      "prompt-grid",
+      "composer",
+      "message-input",
+      "send-button",
+      "stop-button",
+      "composer-status",
+      "status-panel",
+      "status-close",
+      "status-refresh",
+      "panel-signal",
+      "panel-state",
+      "panel-context",
+      "panel-runner",
+      "panel-lease",
+      "panel-waiting",
+      "panel-running",
+      "panel-approval",
+      "panel-completed",
+      "panel-messages",
+      "panel-tools",
+      "panel-text-model",
+      "panel-vision-model",
+      "panel-updated",
+      "auth-gate",
+      "auth-form",
+      "auth-submit",
+      "token-input",
+      "reveal-token",
+      "auth-error",
+      "task-modal",
+      "task-modal-close",
+      "task-modal-title",
+      "task-modal-meta",
+      "task-modal-messages",
+      "task-modal-cancel",
+      "task-modal-dismiss",
+      "toast-region",
+      "connection-banner",
+      "connection-text",
+      "connection-retry",
+    ]) {
+      el[id] = document.getElementById(id);
+    }
+
+    bindEvents();
+    updateComposer();
+
+    if (state.token) {
+      hideAuth();
+      void refreshConversation({ initial: true });
+    } else {
+      showAuth();
+    }
+
+    void refreshPublicStatus();
+    state.statusTimer = window.setInterval(() => void refreshPublicStatus(), STATUS_MS);
   }
 
-  function pollNow() {
-    if (inFlight) return;
-    window.clearTimeout(pollTimer);
-    void pollStatus();
+  function bindEvents() {
+    el["auth-form"].addEventListener("submit", onAuthSubmit);
+    el["reveal-token"].addEventListener("click", toggleTokenVisibility);
+    el["settings-button"].addEventListener("click", showAuth);
+    el["composer"].addEventListener("submit", onSend);
+    el["message-input"].addEventListener("input", onInput);
+    el["message-input"].addEventListener("keydown", onComposerKeydown);
+    el["send-button"].addEventListener("click", onSend);
+    el["stop-button"].addEventListener("click", cancelActiveTask);
+    el["new-chat"].addEventListener("click", newChat);
+    el["status-toggle"].addEventListener("click", toggleStatusPanel);
+    el["status-chip"].addEventListener("click", toggleStatusPanel);
+    el["status-close"].addEventListener("click", closeStatusPanel);
+    el["status-refresh"].addEventListener("click", () => void refreshPublicStatus(true));
+    el["menu-button"].addEventListener("click", openSidebar);
+    el["sidebar-close"].addEventListener("click", closeSidebar);
+    el["sidebar-scrim"].addEventListener("click", closeSidebar);
+    el["connection-retry"].addEventListener("click", () => {
+      void refreshConversation({ force: true });
+      void refreshPublicStatus(true);
+    });
+    el["task-modal-close"].addEventListener("click", closeTaskModal);
+    el["task-modal-dismiss"].addEventListener("click", closeTaskModal);
+    el["task-modal-cancel"].addEventListener("click", cancelModalTask);
+    el["task-modal"].addEventListener("click", (event) => {
+      if (event.target === el["task-modal"]) closeTaskModal();
+    });
+    el["prompt-grid"].addEventListener("click", (event) => {
+      const button = event.target.closest("[data-prompt]");
+      if (!button) return;
+      el["message-input"].value = button.dataset.prompt || "";
+      autoResize();
+      updateComposer();
+      el["message-input"].focus();
+    });
+    el["task-list"].addEventListener("click", (event) => {
+      const button = event.target.closest("[data-task-id]");
+      if (!button) return;
+      closeSidebar();
+      void openTaskModal(button.dataset.taskId);
+    });
+    document.addEventListener("keydown", onGlobalKeydown);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        void refreshConversation({ silent: true });
+        void refreshPublicStatus();
+      }
+    });
   }
 
-  function handleVisibilityChange() {
-    if (document.visibilityState === "visible" && !inFlight && Date.now() >= nextPollAt) pollNow();
-  }
-
-  async function pollStatus() {
-    if (inFlight) return;
-    inFlight = true;
-    elements["refresh-button"].disabled = true;
-    elements["refresh-button"].textContent = "Checking";
-    elements["next-check"].textContent = "Checking now";
-
-    try {
-      const payload = await fetchPublicStatus();
-      const snapshot = normalizeStatus(payload);
-      failureCount = 0;
-      lastSnapshot = snapshot;
-      renderSnapshot(snapshot);
-    } catch (error) {
-      failureCount += 1;
-      const message = error instanceof Error ? error.message : "Public status request failed.";
-      renderUnavailable(message);
-    } finally {
-      inFlight = false;
-      elements["refresh-button"].disabled = false;
-      elements["refresh-button"].textContent = "Check now";
-      const delay = failureCount === 0
-        ? POLL_INTERVAL_MS
-        : Math.min(POLL_INTERVAL_MS * (2 ** Math.min(failureCount - 1, 3)), MAX_BACKOFF_MS);
-      schedulePoll(delay);
+  function onGlobalKeydown(event) {
+    if (event.key === "Escape") {
+      if (!el["task-modal"].hidden) {
+        closeTaskModal();
+      } else if (!el["status-panel"].hidden) {
+        closeStatusPanel();
+      } else if (el.sidebar.classList.contains("is-open")) {
+        closeSidebar();
+      }
+    }
+    if (
+      event.key.toLowerCase() === "n" &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      el["auth-gate"].hidden &&
+      el["task-modal"].hidden &&
+      el["status-panel"].hidden &&
+      !isEditable(document.activeElement)
+    ) {
+      event.preventDefault();
+      void newChat();
     }
   }
 
-  async function fetchPublicStatus() {
+  function isEditable(node) {
+    return node instanceof HTMLElement && (
+      node.tagName === "INPUT" ||
+      node.tagName === "TEXTAREA" ||
+      node.isContentEditable
+    );
+  }
+
+  async function api(path, options = {}) {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const headers = { Accept: "application/json" };
+    if (state.token) headers.Authorization = `Bearer ${state.token}`;
+    if (options.body !== undefined) headers["Content-Type"] = "application/json";
 
     try {
-      const response = await fetch(STATUS_URL, {
-        method: "GET",
+      const response = await fetch(`${API_BASE}${path}`, {
+        method: options.method || "GET",
         mode: "cors",
         credentials: "omit",
         cache: "no-store",
         referrerPolicy: "no-referrer",
-        headers: { Accept: "application/json" },
+        headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
         signal: controller.signal,
       });
-      if (!response.ok) throw new Error(`Public status returned HTTP ${response.status}.`);
-      const payload = await response.json();
-      if (!isRecord(payload)) throw new Error("Public status returned an invalid payload.");
+      let payload = null;
+      if (response.status !== 204) {
+        payload = await response.json().catch(() => null);
+      }
+      if (response.status === 401) throw new AuthError("Access key was rejected.");
+      if (response.status === 503) throw new Error("Web chat is not configured on the runner yet.");
+      if (!response.ok) {
+        const message = payload && typeof payload.error === "string" ? payload.error : `Request failed with HTTP ${response.status}.`;
+        throw new Error(message);
+      }
       return payload;
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
-        throw new Error("Public status timed out after 8 seconds.");
-      }
-      if (error instanceof SyntaxError) throw new Error("Public status returned invalid JSON.");
+      if (error instanceof AuthError) throw error;
+      if (error instanceof DOMException && error.name === "AbortError") throw new Error("The request timed out.");
+      if (error instanceof TypeError) throw new Error("Could not reach the runner.");
       throw error;
     } finally {
       window.clearTimeout(timeout);
     }
   }
 
-  function schedulePoll(delay) {
-    window.clearTimeout(pollTimer);
-    nextPollAt = Date.now() + delay;
-    pollTimer = window.setTimeout(() => void pollStatus(), delay);
-    updateClocks();
-  }
-
-  function normalizeStatus(payload) {
-    const root = isRecord(payload.data) ? payload.data : payload;
-    const agent = record(root.agent);
-    const lease = record(firstDefined(root.lease, agent.lease));
-    const runner = record(firstDefined(root.runner, root.active_runner, agent.runner));
-    const taskAggregate = record(root.tasks);
-    const task = record(firstDefined(root.current_task, root.task, agent.current_task, {
-      status: taskAggregate.last_status,
-      iteration: taskAggregate.last_iteration,
-      updated_at: taskAggregate.last_updated_at,
-    }));
-    const queue = record(firstDefined(root.queue, root.queues, agent.queue, taskAggregate));
-    const stats = record(firstDefined(root.stats, agent.stats));
-    const memory = record(firstDefined(root.memory, stats.memory, agent.memory));
-    const tools = record(firstDefined(root.tools, root.tool_stats, stats.tools, agent.tools));
-
-    const generatedAt = parseTimestamp(firstDefined(
-      root.generated_at,
-      root.checked_at,
-      root.updated_at,
-      payload.generated_at,
-      payload.updated_at,
-    ));
-    const leaseExpiresAt = parseTimestamp(firstDefined(lease.expires_at, lease.expiresAt, root.lease_expires_at));
-    const leaseUpdatedAt = parseTimestamp(firstDefined(lease.updated_at, lease.updatedAt));
-    const contenderSeenAt = parseTimestamp(firstDefined(lease.contender_seen_at, lease.contenderSeenAt));
-    const runnerLastSeenAt = parseTimestamp(firstDefined(
-      runner.last_seen_at,
-      runner.lastSeenAt,
-      runner.heartbeat_at,
-      runner.updated_at,
-      root.runner_last_seen_at,
-    ));
-    const taskUpdatedAt = parseTimestamp(firstDefined(task.updated_at, task.updatedAt));
-
-    const leaseActiveFlag = toBoolean(firstDefined(lease.active, lease.held, lease.holder_present, root.lease_active, root.lease_held));
-    const leaseActive = leaseActiveFlag ?? (leaseExpiresAt === null ? null : leaseExpiresAt > Date.now());
-    const contender = toBoolean(firstDefined(lease.contender, lease.handoff_ready, root.handoff_ready))
-      ?? toBoolean(lease.contender_present)
-      ?? (firstDefined(lease.contender_id, lease.contenderId) != null)
-      ?? false;
-
-    const waiting = toCount(firstDefined(queue.waiting, queue.pending, queue.queued, root.queue_waiting));
-    const running = toCount(firstDefined(queue.running, queue.active, root.queue_running));
-    const approval = toCount(firstDefined(
-      queue.waiting_approval,
-      queue.waitingApproval,
-      queue.approval,
-      queue.approvals,
-      root.queue_waiting_approval,
-    ));
-    const explicitTotal = toCount(firstDefined(queue.total, queue.open, root.queue_total));
-    const queueValues = [waiting, running, approval];
-    const total = explicitTotal ?? (queueValues.every((value) => value !== null)
-      ? queueValues.reduce((sum, value) => sum + value, 0)
-      : null);
-
-    const toolCompleted = toCount(firstDefined(tools.completed, tools.succeeded, tools.success));
-    const toolRunning = toCount(firstDefined(tools.running, tools.pending, tools.in_flight, tools.inFlight));
-    const toolFailed = toCount(firstDefined(tools.failed, tools.errors));
-    const explicitToolTotal = toCount(firstDefined(tools.total, tools.count));
-    const toolValues = [toolCompleted, toolRunning, toolFailed];
-    const toolTotal = explicitToolTotal ?? (toolValues.every((value) => value !== null)
-      ? toolValues.reduce((sum, value) => sum + value, 0)
-      : null);
-
-    const status = normalizedStatus(firstDefined(root.status, root.state, root.agent_status, agent.status));
-    const runnerStatus = normalizedStatus(firstDefined(runner.status, runner.state, root.runner_status));
-    const taskStatus = normalizedStatus(firstDefined(task.status, task.state));
-    const online = toBoolean(firstDefined(root.online, root.is_online, agent.online, runner.online));
-    const staleAfterSeconds = toPositiveNumber(firstDefined(
-      root.stale_after_seconds,
-      runner.stale_after_seconds,
-      runner.staleAfterSeconds,
-    )) ?? DEFAULT_STALE_AFTER_SECONDS;
-
-    const snapshot = {
-      generatedAt,
-      status,
-      online,
-      staleAfterSeconds,
-      lease: {
-        active: leaseActive,
-        expiresAt: leaseExpiresAt,
-        updatedAt: leaseUpdatedAt,
-        contender,
-        contenderSeenAt,
-      },
-      runner: {
-        status: runnerStatus,
-        lastSeenAt: runnerLastSeenAt,
-      },
-      task: {
-        status: taskStatus,
-        iteration: toCount(firstDefined(task.iteration, task.step)),
-        updatedAt: taskUpdatedAt,
-      },
-      queue: { waiting, running, approval, total },
-      memory: {
-        messages: toCount(firstDefined(memory.messages, memory.message_count, memory.retained_messages)),
-        tasks: toCount(firstDefined(memory.tasks, memory.task_count, memory.task_records, memory.summaries, taskAggregate.total)),
-        bytes: toCount(firstDefined(memory.bytes, memory.state_bytes, memory.size_bytes, stats.state_bytes)),
-      },
-      tools: {
-        completed: toolCompleted,
-        running: toolRunning,
-        failed: toolFailed,
-        total: toolTotal ?? toCount(memory.tool_runs),
-      },
-    };
-
-    snapshot.displayState = deriveDisplayState(snapshot);
-    snapshot.standby = deriveStandby(snapshot);
-    return snapshot;
-  }
-
-  function deriveDisplayState(snapshot) {
-    const status = snapshot.status;
-    const runnerStatus = snapshot.runner.status;
-    const bootStates = new Set(["booting", "starting", "initializing"]);
-    const offlineStates = new Set(["offline", "stopped", "shutdown", "unavailable"]);
-    const onlineStates = new Set(["online", "active", "ready", "running", "standby", "idle", "waiting"]);
-
-    if (bootStates.has(status) || bootStates.has(runnerStatus)) return "booting";
-    if (snapshot.online === false || offlineStates.has(status) || offlineStates.has(runnerStatus)) return "offline";
-    if (snapshot.runner.lastSeenAt !== null
-      && Date.now() - snapshot.runner.lastSeenAt > snapshot.staleAfterSeconds * 1_000) return "offline";
-    if (snapshot.online === true || onlineStates.has(status) || onlineStates.has(runnerStatus)) return "online";
-    if (snapshot.lease.active === true || snapshot.runner.lastSeenAt !== null) return "online";
-    if (snapshot.lease.active === false && snapshot.lease.expiresAt !== null) return "offline";
-    return "booting";
-  }
-
-  function deriveStandby(snapshot) {
-    const standbyStates = new Set(["standby", "idle", "waiting"]);
-    if (standbyStates.has(snapshot.status) || standbyStates.has(snapshot.runner.status)) return true;
-    if (snapshot.displayState !== "online") return false;
-    const activeTask = new Set(["running", "waiting_approval"]);
-    if (activeTask.has(snapshot.task.status)) return false;
-    return snapshot.queue.running === 0 || (snapshot.task.status === "unknown" && snapshot.queue.total === 0);
-  }
-
-  function renderSnapshot(snapshot) {
-    document.body.dataset.agentState = snapshot.displayState;
-    document.body.dataset.stale = "false";
-
-    const visualState = snapshot.displayState.toUpperCase();
-    setText("live-state", visualState);
-    setText("api-transport", "CONNECTED");
-    setText("status-detail", "Public aggregate received without credentials.");
-    setCheckedTime(Date.now());
-
-    let context;
-    let mode;
-    if (snapshot.displayState === "online" && snapshot.standby) {
-      context = "Online and standing by for the next Telegram task.";
-      mode = "ONLINE · STANDBY";
-    } else if (snapshot.displayState === "online") {
-      context = snapshot.task.status === "unknown"
-        ? "Runner heartbeat and lease are current."
-        : `Current task is ${humanStatus(snapshot.task.status)}.`;
-      mode = snapshot.task.status === "unknown" ? "ONLINE" : `ONLINE · ${snapshot.task.status.toUpperCase()}`;
-    } else if (snapshot.displayState === "offline") {
-      context = "No current runner heartbeat is confirmed by the aggregate.";
-      mode = "OFFLINE";
-    } else {
-      context = "The service is reachable while the runner initializes.";
-      mode = "BOOTING";
-    }
-
-    setText("state-context", context);
-    setText("operating-mode", mode);
-    announceState(snapshot.displayState, context);
-
-    if (snapshot.generatedAt !== null) {
-      setText("snapshot-note", `Snapshot generated ${relativeTime(snapshot.generatedAt)}.`);
-    } else {
-      setText("snapshot-note", "Current aggregate response; source timestamp not supplied.");
-    }
-
-    renderLease(snapshot.lease);
-    renderRunner(snapshot.runner, snapshot.staleAfterSeconds);
-    renderTask(snapshot.task, snapshot.standby);
-    renderCounts(snapshot);
-    renderTimeline(snapshot);
-  }
-
-  function renderLease(lease) {
-    let state = "UNKNOWN";
-    let caption = "Lease state not supplied";
-    if (lease.active === true) {
-      state = "HELD";
-      caption = "Single active runner selected";
-    } else if (lease.active === false) {
-      state = lease.expiresAt !== null && lease.expiresAt <= Date.now() ? "EXPIRED" : "RELEASED";
-      caption = "No active lease confirmed";
-    }
-    setText("lease-state", state);
-    setText("lease-caption", caption);
-    setTime("lease-expiry", lease.expiresAt, "—");
-    setText("lease-handoff", lease.contender ? "STANDBY SEEN" : lease.active === null ? "—" : "CLEAR");
-  }
-
-  function renderRunner(runner, staleAfterSeconds) {
-    const status = runner.status === "unknown" ? "UNKNOWN" : runner.status.toUpperCase();
-    setText("runner-state", status);
-    setText("runner-caption", runner.status === "unknown" ? "Runner state not supplied" : `Aggregate runner state: ${humanStatus(runner.status)}`);
-    setTime("runner-last-seen", runner.lastSeenAt, "—");
-    if (runner.lastSeenAt === null) {
-      setText("runner-recency", "—");
+  async function onAuthSubmit(event) {
+    event.preventDefault();
+    const token = el["token-input"].value.trim();
+    if (!token) {
+      setAuthError("Paste the access key first.");
       return;
     }
-    const ageSeconds = Math.max(0, Math.floor((Date.now() - runner.lastSeenAt) / 1_000));
-    setText("runner-recency", ageSeconds > staleAfterSeconds ? "STALE" : "CURRENT");
+    el["auth-submit"].disabled = true;
+    el["auth-submit"].textContent = "Checking…";
+    setAuthError("");
+    const previous = state.token;
+    state.token = token;
+    try {
+      await api("/api/agent/web/conversation");
+      sessionStorage.setItem(TOKEN_KEY, token);
+      hideAuth();
+      el["token-input"].value = "";
+      showToast("Console unlocked.");
+      await refreshConversation({ force: true });
+      void refreshPublicStatus(true);
+    } catch (error) {
+      state.token = previous;
+      sessionStorage.removeItem(TOKEN_KEY);
+      setAuthError(error instanceof AuthError ? "That key was rejected." : error.message);
+    } finally {
+      el["auth-submit"].disabled = false;
+      el["auth-submit"].textContent = "Enter console";
+    }
   }
 
-  function renderTask(task, standby) {
-    const noTask = task.status === "unknown";
-    setText("task-state", noTask ? (standby ? "NONE" : "UNKNOWN") : task.status.toUpperCase());
-    setText("task-caption", noTask ? (standby ? "No active aggregate task" : "Task state not supplied") : `Current task is ${humanStatus(task.status)}`);
-    setText("task-iteration", task.iteration === null ? "—" : formatCount(task.iteration));
-    setTime("task-updated", task.updatedAt, "—");
+  function showAuth() {
+    el["auth-gate"].hidden = false;
+    el["auth-error"].hidden = true;
+    el["auth-error"].textContent = "";
+    if (state.token) el["token-input"].value = state.token;
+    window.setTimeout(() => el["token-input"].focus(), 30);
   }
 
-  function renderCounts(snapshot) {
-    setCount("queue-waiting", snapshot.queue.waiting);
-    setCount("queue-running", snapshot.queue.running);
-    setCount("queue-approval", snapshot.queue.approval);
-    setCount("queue-total", snapshot.queue.total);
-    setCount("memory-messages", snapshot.memory.messages);
-    setCount("memory-tasks", snapshot.memory.tasks);
-    setText("memory-bytes", snapshot.memory.bytes === null ? "—" : formatBytes(snapshot.memory.bytes));
-    setCount("tools-completed", snapshot.tools.completed);
-    setCount("tools-running", snapshot.tools.running);
-    setCount("tools-failed", snapshot.tools.failed);
-    setCount("tools-total", snapshot.tools.total);
+  function hideAuth() {
+    el["auth-gate"].hidden = true;
   }
 
-  function renderTimeline(snapshot) {
-    const events = [];
-    if (snapshot.generatedAt !== null) {
-      events.push({
-        time: snapshot.generatedAt,
-        title: "Aggregate snapshot",
-        detail: "Public status snapshot generated by the source.",
-      });
+  function setAuthError(message) {
+    state.authError = message;
+    el["auth-error"].hidden = !message;
+    el["auth-error"].textContent = message;
+  }
+
+  function toggleTokenVisibility() {
+    const input = el["token-input"];
+    const reveal = input.type === "password";
+    input.type = reveal ? "text" : "password";
+    el["reveal-token"].textContent = reveal ? "Hide" : "Show";
+    el["reveal-token"].setAttribute("aria-label", reveal ? "Hide access key" : "Show access key");
+  }
+
+  async function refreshConversation(options = {}) {
+    if (!state.token || state.loading) return;
+    state.loading = true;
+    try {
+      const payload = await api("/api/agent/web/conversation");
+      applyConversation(payload, options);
+      hideConnectionError();
+      if (options.initial) showConnectionReady();
+    } catch (error) {
+      if (error instanceof AuthError) {
+        state.token = "";
+        sessionStorage.removeItem(TOKEN_KEY);
+        showAuth();
+        setAuthError("Your session key expired. Unlock again.");
+        return;
+      }
+      if (!options.silent) showConnectionError(error.message);
+      if (options.force) showToast(error.message, "error");
+    } finally {
+      state.loading = false;
+      scheduleConversationPoll();
     }
-    if (snapshot.runner.lastSeenAt !== null) {
-      events.push({
-        time: snapshot.runner.lastSeenAt,
-        title: "Runner heartbeat",
-        detail: snapshot.runner.status === "unknown"
-          ? "Runner last-seen timestamp recorded."
-          : `Runner reported ${humanStatus(snapshot.runner.status)}.`,
-      });
+  }
+
+  function applyConversation(payload, options = {}) {
+    const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+    const tasks = Array.isArray(payload?.tasks) ? payload.tasks : [];
+    const nextSignature = JSON.stringify({ messages, tasks });
+    const changed = nextSignature !== state.signature;
+    state.messages = messages;
+    state.tasks = tasks;
+    state.activeTask = latestOpenTask(tasks);
+    if (changed) {
+      state.signature = nextSignature;
+      renderTaskList();
+      renderMessages({ stick: options.force === true || options.initial === true || isNearBottom() });
+      updateComposer();
+    } else {
+      updateComposer();
     }
-    if (snapshot.task.updatedAt !== null) {
-      const iteration = snapshot.task.iteration === null ? "iteration not supplied" : `iteration ${formatCount(snapshot.task.iteration)}`;
-      events.push({
-        time: snapshot.task.updatedAt,
-        title: "Current task updated",
-        detail: `${humanStatus(snapshot.task.status)} · ${iteration}.`,
-      });
-    }
-    if (snapshot.lease.updatedAt !== null) {
-      events.push({
-        time: snapshot.lease.updatedAt,
-        title: "Lease record updated",
-        detail: snapshot.lease.active === true ? "Active runner lease confirmed." : "Lease is not active.",
-      });
-    }
-    if (snapshot.lease.contenderSeenAt !== null) {
-      events.push({
-        time: snapshot.lease.contenderSeenAt,
-        title: "Standby runner observed",
-        detail: "Aggregate lease data reports a handoff contender.",
-      });
+  }
+
+  function latestOpenTask(tasks) {
+    return tasks.find((task) => OPEN_STATUSES.has(task.status)) || null;
+  }
+
+  function renderMessages(options = {}) {
+    const stick = options.stick !== false;
+    for (const node of Array.from(el.transcript.children)) {
+      if (node !== el.welcome) node.remove();
     }
 
-    events.sort((left, right) => right.time - left.time);
-    elements["activity-list"].replaceChildren();
-    if (events.length === 0) {
-      renderEmptyTimeline("No timestamped aggregate activity is present in this snapshot.");
+    if (state.messages.length === 0) {
+      el.welcome.hidden = false;
+    } else {
+      el.welcome.hidden = true;
+      for (const message of state.messages) {
+        el.transcript.append(renderMessage(message));
+      }
+    }
+
+    const task = latestTask();
+    if (task && task.status === "running") {
+      el.transcript.append(renderTaskNote("Working", `Iteration ${task.iteration || 0}. The runner is inspecting or executing.`, "thinking"));
+    } else if (task && task.status === "waiting") {
+      el.transcript.append(renderTaskNote("Queued", "Waiting for the active runner to pick up this task.", "thinking"));
+    } else if (task && task.status === "waiting_approval") {
+      el.transcript.append(renderTaskNote(
+        "Approval required",
+        "A risky tool call is paused. Open Telegram to approve or reject it; this console will update automatically.",
+        "note",
+      ));
+    } else if (task && task.status === "failed" && task.last_error) {
+      el.transcript.append(renderTaskNote("Task failed", task.last_error, "note"));
+    }
+
+    if (stick) scrollToBottom();
+  }
+
+  function renderMessage(message) {
+    const article = document.createElement("article");
+    article.className = `message ${message.role === "user" ? "user" : "agent"}`;
+
+    const avatar = document.createElement("div");
+    avatar.className = "avatar";
+    avatar.setAttribute("aria-hidden", "true");
+    avatar.textContent = message.role === "user" ? "Y" : "T";
+
+    const content = document.createElement("div");
+    const head = document.createElement("div");
+    head.className = "message-head";
+    const author = document.createElement("strong");
+    author.textContent = message.role === "user" ? "You" : "TrixAgent";
+    const time = document.createElement("time");
+    time.dateTime = message.created_at || "";
+    time.textContent = formatTime(message.created_at);
+    head.append(author, time);
+
+    const body = document.createElement("div");
+    body.className = "message-body";
+    renderRichText(body, message.content || "");
+
+    content.append(head, body);
+    article.append(avatar, content);
+    return article;
+  }
+
+  function renderTaskNote(label, text, kind) {
+    const note = document.createElement("div");
+    note.className = kind === "thinking" ? "thinking" : "task-note";
+    if (kind === "thinking") {
+      const dots = document.createElement("span");
+      dots.className = "thinking-dots";
+      dots.setAttribute("aria-hidden", "true");
+      for (let index = 0; index < 3; index += 1) dots.append(document.createElement("i"));
+      const copy = document.createElement("span");
+      copy.textContent = `${label} · ${text}`;
+      note.append(dots, copy);
+    } else {
+      const strong = document.createElement("strong");
+      strong.textContent = `${label}: `;
+      note.append(strong, document.createTextNode(text));
+    }
+    return note;
+  }
+
+  function renderRichText(parent, text) {
+    const fence = /```([^\n`]*)\n?([\s\S]*?)```/g;
+    let cursor = 0;
+    let match;
+    while ((match = fence.exec(text)) !== null) {
+      if (match.index > cursor) appendProse(parent, text.slice(cursor, match.index));
+      appendCodeBlock(parent, (match[1] || "").trim(), match[2] || "");
+      cursor = fence.lastIndex;
+    }
+    if (cursor < text.length) appendProse(parent, text.slice(cursor));
+  }
+
+  function appendProse(parent, text) {
+    const blocks = text.replace(/^\n+|\n+$/g, "").split(/\n{2,}/);
+    for (const block of blocks) {
+      if (!block.trim()) continue;
+      const paragraph = document.createElement("p");
+      const lines = block.split("\n");
+      lines.forEach((line, index) => {
+        appendInline(paragraph, line);
+        if (index < lines.length - 1) paragraph.append(document.createElement("br"));
+      });
+      parent.append(paragraph);
+    }
+  }
+
+  function appendInline(parent, text) {
+    const parts = text.split(/(`[^`\n]+`)/g);
+    for (const part of parts) {
+      if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+        const code = document.createElement("code");
+        code.textContent = part.slice(1, -1);
+        parent.append(code);
+      } else if (part) {
+        parent.append(document.createTextNode(part));
+      }
+    }
+  }
+
+  function appendCodeBlock(parent, language, code) {
+    const block = document.createElement("div");
+    block.className = "code-block";
+    const head = document.createElement("div");
+    head.className = "code-head";
+    const label = document.createElement("span");
+    label.textContent = language || "code";
+    const copy = document.createElement("button");
+    copy.className = "copy-code";
+    copy.type = "button";
+    copy.textContent = "Copy";
+    copy.addEventListener("click", () => {
+      void navigator.clipboard.writeText(code).then(() => {
+        copy.textContent = "Copied";
+        window.setTimeout(() => { copy.textContent = "Copy"; }, 1_500);
+      }).catch(() => showToast("Clipboard is unavailable.", "error"));
+    });
+    head.append(label, copy);
+    const pre = document.createElement("pre");
+    const codeEl = document.createElement("code");
+    codeEl.textContent = code.replace(/\n$/, "");
+    pre.append(codeEl);
+    block.append(head, pre);
+    parent.append(block);
+  }
+
+  function renderTaskList() {
+    el["task-list"].replaceChildren();
+    el["task-count"].textContent = String(state.tasks.length);
+    if (state.tasks.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "sidebar-empty";
+      empty.textContent = "Tasks appear here once you send the first message.";
+      el["task-list"].append(empty);
       return;
     }
 
-    for (const event of events.slice(0, 5)) {
-      const item = document.createElement("li");
-      const time = document.createElement("time");
-      const copy = document.createElement("div");
+    for (const task of state.tasks.slice(0, 12)) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "task-item";
+      button.dataset.taskId = task.id;
+      const dot = document.createElement("span");
+      dot.className = "task-state-dot";
+      dot.dataset.status = task.status;
+      dot.setAttribute("aria-hidden", "true");
+      const copy = document.createElement("span");
       const title = document.createElement("strong");
-      const detail = document.createElement("span");
-
-      time.dateTime = new Date(event.time).toISOString();
-      time.textContent = formatExactTime(event.time);
-      time.title = relativeTime(event.time);
-      copy.className = "activity-copy";
-      title.textContent = event.title;
-      detail.textContent = event.detail;
-      copy.append(title, detail);
-      item.append(time, copy);
-      elements["activity-list"].append(item);
+      title.textContent = taskTitle(task);
+      const meta = document.createElement("small");
+      meta.textContent = `${statusLabel(task.status)} · ${relativeTime(task.updated_at || task.created_at)}`;
+      copy.append(title, meta);
+      button.append(dot, copy);
+      el["task-list"].append(button);
     }
   }
 
-  function renderEmptyTimeline(message) {
-    const item = document.createElement("li");
-    item.className = "activity-empty";
-    item.textContent = message;
-    elements["activity-list"].replaceChildren(item);
+  function taskTitle(task) {
+    const message = state.messages.find((item) => item.task_id === task.id && item.role === "user");
+    const text = (message?.content || "Task").replace(/\s+/g, " ").trim();
+    return text.length > 58 ? `${text.slice(0, 58)}…` : text;
   }
 
-  function renderUnavailable(message) {
-    document.body.dataset.agentState = "unavailable";
-    document.body.dataset.stale = lastSnapshot === null ? "false" : "true";
-    setText("live-state", "API UNAVAILABLE");
-    setText("state-context", "The public API did not return a current snapshot. Agent state is not inferred.");
-    setText("operating-mode", "API UNAVAILABLE");
-    setText("api-transport", "RETRYING");
-    setText("status-detail", sanitizeMessage(message));
-    setCheckedTime(Date.now());
-    setText("snapshot-note", lastSnapshot === null
-      ? "No aggregate snapshot is available."
-      : "Showing the last valid snapshot as stale data.");
-    announceState("unavailable", "Public status API is unavailable; no agent state is inferred.");
-    if (lastSnapshot === null) renderEmptyTimeline("No aggregate activity is available while the status API is unreachable.");
+  function statusLabel(status) {
+    return {
+      waiting: "Queued",
+      running: "Running",
+      waiting_approval: "Approval",
+      completed: "Complete",
+      failed: "Failed",
+      cancelled: "Cancelled",
+    }[status] || "Task";
   }
 
-  function announceState(state, context) {
-    if (state === lastAnnouncedState) return;
-    lastAnnouncedState = state;
-    setText("state-announcement", `TrixAgent status: ${state}. ${context}`);
+  function relativeTime(value) {
+    const timestamp = Date.parse(value || "");
+    if (!Number.isFinite(timestamp)) return "just now";
+    const seconds = Math.round((Date.now() - timestamp) / 1000);
+    if (seconds < 45) return "just now";
+    if (seconds < 3_600) return `${Math.round(seconds / 60)}m ago`;
+    if (seconds < 86_400) return `${Math.round(seconds / 3_600)}h ago`;
+    return `${Math.round(seconds / 86_400)}d ago`;
   }
 
-  function setCheckedTime(timestamp) {
-    setTime("last-checked", timestamp, "Not checked yet");
+  function formatTime(value) {
+    const timestamp = Date.parse(value || "");
+    if (!Number.isFinite(timestamp)) return "";
+    return new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(timestamp);
   }
 
-  function setTime(id, timestamp, fallback) {
-    const element = elements[id];
-    if (timestamp === null || !Number.isFinite(timestamp)) {
-      delete element.dataset.timestamp;
-      element.removeAttribute("datetime");
-      element.removeAttribute("title");
-      element.textContent = fallback;
+  function onInput() {
+    autoResize();
+    updateComposer();
+  }
+
+  function autoResize() {
+    const input = el["message-input"];
+    input.style.height = "auto";
+    input.style.height = `${Math.min(210, Math.max(54, input.scrollHeight))}px`;
+  }
+
+  function onComposerKeydown(event) {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    if (!el["send-button"].disabled) void onSend(event);
+  }
+
+  async function onSend(event) {
+    event.preventDefault();
+    if (state.sending || !state.token) return;
+    const content = el["message-input"].value.trim();
+    if (!content) return;
+
+    state.sending = true;
+    el["message-input"].value = "";
+    autoResize();
+    updateComposer();
+
+    const optimistic = {
+      id: `local-${Date.now()}`,
+      task_id: null,
+      role: "user",
+      kind: "text",
+      content,
+      created_at: new Date().toISOString(),
+    };
+    state.messages.push(optimistic);
+    state.signature = "";
+    renderMessages({ stick: true });
+
+    try {
+      const payload = await api("/api/agent/web/message", { method: "POST", body: { content } });
+      if (payload?.task?.id) {
+        state.activeTask = payload.task;
+      }
+      await refreshConversation({ force: true, silent: true });
+      showToast("Task queued. The runner will pick it up.");
+    } catch (error) {
+      state.messages = state.messages.filter((message) => message.id !== optimistic.id);
+      state.signature = "";
+      renderMessages({ stick: true });
+      el["message-input"].value = content;
+      autoResize();
+      updateComposer();
+      if (error instanceof AuthError) {
+        state.token = "";
+        sessionStorage.removeItem(TOKEN_KEY);
+        showAuth();
+        setAuthError("Your session key expired. Unlock again.");
+      } else {
+        showToast(error.message, "error");
+      }
+    } finally {
+      state.sending = false;
+      updateComposer();
+      scheduleConversationPoll();
+      el["message-input"].focus();
+    }
+  }
+
+  function updateComposer() {
+    const input = el["message-input"];
+    const active = state.activeTask;
+    const canSend = Boolean(state.token) && !state.sending && input.value.trim().length > 0;
+    el["send-button"].disabled = !canSend;
+    el["stop-button"].hidden = !active;
+    if (state.sending) {
+      el["composer-status"].textContent = "Queueing";
+      el["composer-status"].dataset.state = "active";
+    } else if (active) {
+      el["composer-status"].textContent = statusLabel(active.status);
+      el["composer-status"].dataset.state = active.status === "waiting_approval" ? "error" : "active";
+    } else {
+      el["composer-status"].textContent = "Ready";
+      el["composer-status"].dataset.state = "";
+    }
+  }
+
+  async function cancelActiveTask() {
+    const task = latestOpenTask(state.tasks);
+    if (!task) return;
+    el["stop-button"].disabled = true;
+    try {
+      await api(`/api/agent/web/task/${encodeURIComponent(task.id)}/cancel`, { method: "POST" });
+      showToast("Cancellation recorded.");
+      await refreshConversation({ force: true, silent: true });
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      el["stop-button"].disabled = false;
+      updateComposer();
+    }
+  }
+
+  async function newChat() {
+    if (!state.token) {
+      showAuth();
       return;
     }
-    element.dataset.timestamp = String(timestamp);
-    element.dateTime = new Date(timestamp).toISOString();
-    element.title = formatExactTime(timestamp);
-    element.textContent = relativeTime(timestamp);
-  }
-
-  function updateClocks() {
-    for (const element of document.querySelectorAll("time[data-timestamp]")) {
-      const timestamp = Number(element.dataset.timestamp);
-      if (Number.isFinite(timestamp)) element.textContent = relativeTime(timestamp);
-    }
-
-    if (!inFlight && nextPollAt > 0) {
-      const remaining = Math.max(0, Math.ceil((nextPollAt - Date.now()) / 1_000));
-      const backoff = failureCount > 1 ? " · backoff" : "";
-      elements["next-check"].textContent = remaining === 0 ? "Due now" : `In ${remaining}s${backoff}`;
-    }
-
-    if (lastSnapshot !== null && document.body.dataset.agentState !== "unavailable") {
-      renderRunner(lastSnapshot.runner, lastSnapshot.staleAfterSeconds);
-      if (lastSnapshot.lease.expiresAt !== null) setTime("lease-expiry", lastSnapshot.lease.expiresAt, "—");
-      if (lastSnapshot.task.updatedAt !== null) setTime("task-updated", lastSnapshot.task.updatedAt, "—");
+    const open = latestOpenTask(state.tasks);
+    if (open && !window.confirm("Start a new chat? Open web tasks will be cancelled. Telegram context stays untouched.")) return;
+    try {
+      await api("/api/agent/web/new", { method: "POST" });
+      state.messages = [];
+      state.signature = "";
+      state.activeTask = null;
+      renderMessages({ stick: false });
+      await refreshConversation({ force: true, silent: true });
+      showToast("New chat started.");
+      closeSidebar();
+      el["message-input"].focus();
+    } catch (error) {
+      showToast(error.message, "error");
     }
   }
 
-  function setCount(id, value) {
-    setText(id, value === null ? "—" : formatCount(value));
+  function scheduleConversationPoll() {
+    window.clearTimeout(state.pollTimer);
+    const active = latestOpenTask(state.tasks);
+    let delay = POLL_IDLE_MS;
+    if (state.sending || active?.status === "running" || active?.status === "waiting") delay = POLL_ACTIVE_MS;
+    else if (active?.status === "waiting_approval") delay = POLL_WAITING_MS;
+    if (document.visibilityState === "hidden") delay = Math.max(delay, 15_000);
+    state.pollTimer = window.setTimeout(() => void refreshConversation({ silent: true }), delay);
   }
 
-  function setText(id, value) {
-    elements[id].textContent = value;
+  function latestTask() {
+    return state.tasks[0] || null;
   }
 
-  function relativeTime(timestamp) {
-    const deltaSeconds = Math.round((timestamp - Date.now()) / 1_000);
-    const absolute = Math.abs(deltaSeconds);
-    if (absolute < 5) return "just now";
+  function isNearBottom() {
+    return el.transcript.scrollHeight - el.transcript.scrollTop - el.transcript.clientHeight < 160;
+  }
 
-    let value;
-    let unit;
-    if (absolute < 60) {
-      value = absolute;
-      unit = "s";
-    } else if (absolute < 3_600) {
-      value = Math.round(absolute / 60);
-      unit = "m";
-    } else if (absolute < 86_400) {
-      value = Math.round(absolute / 3_600);
-      unit = "h";
+  function scrollToBottom() {
+    window.requestAnimationFrame(() => {
+      el.transcript.scrollTop = el.transcript.scrollHeight;
+    });
+  }
+
+  function showConnectionReady() {
+    hideConnectionError();
+  }
+
+  function showConnectionError(message) {
+    el["connection-text"].textContent = message || "Connection lost. Retrying…";
+    el["connection-banner"].hidden = false;
+  }
+
+  function hideConnectionError() {
+    el["connection-banner"].hidden = true;
+  }
+
+  function showToast(message, kind = "info") {
+    const toast = document.createElement("div");
+    toast.className = "toast";
+    toast.dataset.kind = kind;
+    toast.textContent = message;
+    el["toast-region"].append(toast);
+    window.setTimeout(() => toast.remove(), 4_200);
+  }
+
+  async function refreshPublicStatus(force = false) {
+    try {
+      const response = await fetch(`${API_BASE}/api/agent/public-status`, {
+        mode: "cors",
+        credentials: "omit",
+        cache: "no-store",
+        referrerPolicy: "no-referrer",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) throw new Error(`Status HTTP ${response.status}`);
+      const payload = await response.json();
+      applyPublicStatus(payload);
+    } catch {
+      applyPublicStatus(null);
+      if (force) showToast("Public status is unavailable.", "error");
+    }
+  }
+
+  function applyPublicStatus(payload) {
+    state.publicStatus = payload;
+    const online = Boolean(payload?.ok && payload?.online);
+    const taskSummary = payload?.tasks || {};
+    const running = Number(taskSummary.running || 0);
+    const statusState = online ? (running > 0 ? "busy" : "online") : "offline";
+    const statusText = online ? (running > 0 ? "Running a task" : "Online") : "Offline";
+    const runnerStatus = payload?.runner?.status || "unknown";
+    const model = payload?.runner?.model || "";
+
+    for (const dot of [el["sidebar-signal"], el["top-signal"], el["panel-signal"]]) {
+      dot.dataset.state = statusState;
+    }
+    el["sidebar-status"].textContent = statusText;
+    el["top-status"].textContent = online ? (running > 0 ? "Working" : "Online") : "Offline";
+    el["panel-state"].textContent = online ? "Runner online" : "Runner offline";
+    el["panel-context"].textContent = online
+      ? `Lease held by the active runner. Status: ${runnerStatus}.`
+      : "No live lease and no recent runner heartbeat.";
+    el["panel-runner"].textContent = online ? runnerLabel(runnerStatus) : "—";
+    el["panel-lease"].textContent = payload?.lease?.holder_present ? "Held" : "Open";
+    el["panel-waiting"].textContent = count(taskSummary.waiting);
+    el["panel-running"].textContent = count(taskSummary.running);
+    el["panel-approval"].textContent = count(taskSummary.waiting_approval);
+    el["panel-completed"].textContent = count(taskSummary.completed);
+    el["panel-messages"].textContent = count(payload?.memory?.messages);
+    el["panel-tools"].textContent = count(payload?.memory?.tool_runs);
+    el["panel-text-model"].textContent = payload?.providers?.text || "Groq GPT-OSS 120B";
+    el["panel-vision-model"].textContent = payload?.providers?.vision || "Gemini Flash";
+    el["model-name"].textContent = modelLabel(model) || "Groq · GPT-OSS 120B";
+    el["panel-updated"].textContent = payload?.checked_at
+      ? `Checked ${formatTime(new Date(payload.checked_at * 1000).toISOString())}`
+      : "Not checked yet";
+  }
+
+  function count(value) {
+    return Number.isFinite(Number(value)) ? String(Number(value)) : "—";
+  }
+
+  function runnerLabel(value) {
+    if (!value || value === "unknown") return "Unknown";
+    return value.charAt(0).toUpperCase() + value.slice(1);
+  }
+
+  function modelLabel(model) {
+    if (!model) return "";
+    if (/gpt-oss/i.test(model)) return "Groq · GPT-OSS 120B";
+    if (/gemini/i.test(model)) return `Gemini · ${model.replace(/^.*\//, "")}`;
+    return model;
+  }
+
+  function toggleStatusPanel() {
+    if (el["status-panel"].hidden) {
+      el["status-panel"].hidden = false;
+      el["status-toggle"].setAttribute("aria-expanded", "true");
+      el["status-chip"].setAttribute("aria-expanded", "true");
+      void refreshPublicStatus();
     } else {
-      value = Math.round(absolute / 86_400);
-      unit = "d";
+      closeStatusPanel();
     }
-    return deltaSeconds < 0 ? `${value}${unit} ago` : `in ${value}${unit}`;
   }
 
-  function formatExactTime(timestamp) {
-    return new Intl.DateTimeFormat(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    }).format(new Date(timestamp));
+  function closeStatusPanel() {
+    el["status-panel"].hidden = true;
+    el["status-toggle"].setAttribute("aria-expanded", "false");
+    el["status-chip"].setAttribute("aria-expanded", "false");
   }
 
-  function formatCount(value) {
-    return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
+  function openSidebar() {
+    el.sidebar.classList.add("is-open");
+    el["sidebar-scrim"].hidden = false;
+    el["menu-button"].setAttribute("aria-expanded", "true");
   }
 
-  function formatBytes(bytes) {
-    if (bytes === 0) return "0 B";
-    const units = ["B", "KiB", "MiB", "GiB"];
-    const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-    const value = bytes / (1024 ** unitIndex);
-    return `${value.toFixed(unitIndex === 0 || value >= 10 ? 0 : 1)} ${units[unitIndex]}`;
+  function closeSidebar() {
+    el.sidebar.classList.remove("is-open");
+    el["sidebar-scrim"].hidden = true;
+    el["menu-button"].setAttribute("aria-expanded", "false");
   }
 
-  function parseTimestamp(value) {
-    if (value === null || value === undefined || value === "") return null;
-    let timestamp;
-    if (typeof value === "number" && Number.isFinite(value)) {
-      timestamp = value < 1_000_000_000_000 ? value * 1_000 : value;
-    } else if (typeof value === "string" && /^\d{10,13}$/.test(value.trim())) {
-      const numeric = Number(value);
-      timestamp = value.trim().length <= 10 ? numeric * 1_000 : numeric;
-    } else if (typeof value === "string") {
-      timestamp = Date.parse(value);
+  async function openTaskModal(taskId) {
+    if (!taskId) return;
+    el["task-modal"].hidden = false;
+    el["task-modal-title"].textContent = "Loading task";
+    el["task-modal-meta"].replaceChildren();
+    el["task-modal-messages"].replaceChildren();
+    el["task-modal-cancel"].hidden = true;
+    state.taskModalId = taskId;
+    try {
+      const payload = await api(`/api/agent/web/task/${encodeURIComponent(taskId)}`);
+      state.taskModalTask = payload.task;
+      renderTaskModal(payload);
+    } catch (error) {
+      closeTaskModal();
+      showToast(error.message, "error");
+    }
+  }
+
+  function renderTaskModal(payload) {
+    const task = payload.task || {};
+    state.taskModalTask = task;
+    el["task-modal-title"].textContent = `Task ${String(task.id || "").slice(0, 8)}`;
+    el["task-modal-meta"].replaceChildren();
+    for (const value of [
+      statusLabel(task.status),
+      `iteration ${task.iteration || 0}`,
+      task.updated_at ? `updated ${relativeTime(task.updated_at)}` : "",
+    ]) {
+      if (!value) continue;
+      const span = document.createElement("span");
+      span.textContent = value;
+      el["task-modal-meta"].append(span);
+    }
+    el["task-modal-messages"].replaceChildren();
+    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    if (messages.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "task-message";
+      empty.textContent = "No visible messages for this task yet.";
+      el["task-modal-messages"].append(empty);
     } else {
-      return null;
+      for (const message of messages) {
+        const block = document.createElement("div");
+        block.className = "task-message";
+        const label = document.createElement("strong");
+        label.textContent = message.role === "user" ? "You" : "TrixAgent";
+        const body = document.createElement("div");
+        renderRichText(body, message.content || "");
+        block.append(label, body);
+        el["task-modal-messages"].append(block);
+      }
     }
-    return Number.isFinite(timestamp) ? timestamp : null;
+    if (task.last_error) {
+      const error = document.createElement("p");
+      error.className = "task-message task-error";
+      error.textContent = task.last_error;
+      el["task-modal-messages"].append(error);
+    }
+    el["task-modal-cancel"].hidden = !OPEN_STATUSES.has(task.status) && task.status !== "failed";
   }
 
-  function normalizedStatus(value) {
-    if (typeof value !== "string") return "unknown";
-    const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, "_");
-    const allowed = new Set([
-      "active",
-      "booting",
-      "cancelled",
-      "completed",
-      "failed",
-      "idle",
-      "initializing",
-      "offline",
-      "online",
-      "ready",
-      "running",
-      "shutdown",
-      "standby",
-      "starting",
-      "stopped",
-      "unavailable",
-      "waiting",
-      "waiting_approval",
-    ]);
-    return allowed.has(normalized) ? normalized : "unknown";
+  function closeTaskModal() {
+    el["task-modal"].hidden = true;
+    state.taskModalId = null;
+    state.taskModalTask = null;
   }
 
-  function humanStatus(status) {
-    if (status === "unknown") return "status not supplied";
-    return status.replaceAll("_", " ");
-  }
-
-  function toCount(value) {
-    if (typeof value === "boolean" || value === null || value === undefined || value === "") return null;
-    const number = Number(value);
-    return Number.isSafeInteger(number) && number >= 0 ? number : null;
-  }
-
-  function toPositiveNumber(value) {
-    const number = Number(value);
-    return Number.isFinite(number) && number > 0 ? number : null;
-  }
-
-  function toBoolean(value) {
-    if (typeof value === "boolean") return value;
-    if (value === 1 || value === "1" || value === "true") return true;
-    if (value === 0 || value === "0" || value === "false") return false;
-    return null;
-  }
-
-  function firstDefined(...values) {
-    return values.find((value) => value !== undefined && value !== null);
-  }
-
-  function record(value) {
-    return isRecord(value) ? value : {};
-  }
-
-  function isRecord(value) {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
-  }
-
-  function sanitizeMessage(message) {
-    const safeMessages = [
-      "Browser network is offline.",
-      "Public status timed out after 8 seconds.",
-      "Public status returned an invalid payload.",
-      "Public status returned invalid JSON.",
-    ];
-    if (safeMessages.includes(message) || /^Public status returned HTTP \d{3}\.$/.test(message)) return message;
-    return "Public status could not be reached. A retry is scheduled.";
+  async function cancelModalTask() {
+    const task = state.taskModalTask;
+    if (!task) return;
+    el["task-modal-cancel"].disabled = true;
+    try {
+      await api(`/api/agent/web/task/${encodeURIComponent(task.id)}/cancel`, { method: "POST" });
+      showToast("Task cancelled.");
+      closeTaskModal();
+      await refreshConversation({ force: true, silent: true });
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      el["task-modal-cancel"].disabled = false;
+    }
   }
 
   initialize();
